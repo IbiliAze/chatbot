@@ -3,9 +3,7 @@ import { OpenAIEmbeddings, ChatOpenAI, OpenAIEmbeddingModelId, OpenAIChatModelId
 import { PGVectorStore } from "@langchain/pgvector";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { Document } from "@langchain/core/documents";
-import { ChatPromptTemplate, MessagesPlaceholder, PromptTemplate } from "@langchain/core/prompts";
-import { Injectable } from "@nestjs/common";
-import { ConfigService } from "@nestjs/config";
+import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { RunnablePassthrough, RunnableSequence } from "@langchain/core/runnables";
 import { ChatResponse, ChatResponseSchema } from "./schemas/response.schema";
 import { InMemoryChatMessageHistory } from "@langchain/core/chat_history";
@@ -20,6 +18,14 @@ export class ChatBot {
   private readonly sessionStore: Map<string, InMemoryChatMessageHistory>;
   private readonly advancedRetriever: boolean = false;
 
+  /**
+   * Wires up the RAG stack: the pgvector store (with OpenAI embeddings), the
+   * chat model, and the text splitter used when ingesting documents. Nothing
+   * touches the database yet — the table is created lazily on first write.
+   *
+   * @param config Connection details, API key, model overrides, and whether to
+   *   enable the multi-query retriever.
+   */
   constructor(config: Config) {
     const {
       apiKey,
@@ -61,6 +67,15 @@ export class ChatBot {
     console.log(` Vector store: ${this.store.tableName}`);
   }
 
+  /**
+   * Answers a question against the ingested knowledge base. Retrieves relevant
+   * chunks (multi-query when enabled), grounds the model on that context plus
+   * the last 10 turns of history, and returns a structured answer with
+   * citations and a confidence rating. The exchange is appended to history.
+   *
+   * @param question The user's natural-language question.
+   * @returns The structured answer; `keyQuotes`/`followUpQuestions` default to [].
+   */
   async ask(question: string): Promise<ChatResponse> {
     const history = this.getSessionHistory("new_test");
     const retriever = this.buildRetriever();
@@ -106,16 +121,27 @@ export class ChatBot {
     };
   }
 
+  /**
+   * Drops a conversation's in-memory history and removes it from the session
+   * store. No-op (logs only) if the session doesn't exist.
+   *
+   * @param sessionId The conversation to clear.
+   */
   clearSession(sessionId: string) {
     const session = this.sessionStore.get(sessionId);
     if (session) {
       session.clear();
       this.sessionStore.delete(sessionId);
       console.log(`Cleared session: ${sessionId}`);
-    }
-    console.log(`No session to clear under: ${sessionId}`);
+    } else console.log(`No session to clear under: ${sessionId}`);
   }
 
+  /**
+   * Returns a conversation's history as plain `{ role, context }` objects for
+   * display. Empty array if the session doesn't exist.
+   *
+   * @param sessionId The conversation to read.
+   */
   async getSessionHistoryDisplay(sessionId: string) {
     const session = this.sessionStore.get(sessionId);
 
@@ -127,12 +153,29 @@ export class ChatBot {
     }));
   }
 
+  /**
+   * Convenience wrapper over {@link addDocuments}: wraps raw strings as
+   * `Document`s tagged with the given source, then ingests them.
+   *
+   * @param texts Raw text blocks to embed and store.
+   * @param source Citation label applied to every text.
+   * @returns The number of chunks written after splitting.
+   */
   async addTexts({ source, texts }: { texts: string[]; source: string }): Promise<ChunkLength> {
     const docs: Document[] = texts.map((t) => new Document({ pageContent: t, metadata: { source } }));
 
     return await this.addDocuments({ documents: docs, source });
   }
 
+  /**
+   * Splits documents into overlapping chunks, stamps each with an `indexedAt`
+   * timestamp, ensures the pgvector table exists, and embeds + stores them.
+   *
+   * @param documents Documents to ingest.
+   * @param source Optional citation label; overwrites each document's
+   *   `metadata.source` when provided.
+   * @returns The number of chunks written.
+   */
   async addDocuments({ documents, source }: { documents: Document[]; source?: string }): Promise<ChunkLength> {
     for (const doc of documents) if (source) doc.metadata.source = source;
 
@@ -146,6 +189,12 @@ export class ChatBot {
     return chunks.length;
   }
 
+  /**
+   * Counts the chunks currently stored in the vector table (creating the table
+   * first if it doesn't exist yet).
+   *
+   * @returns The total number of stored chunks.
+   */
   async getDocumentCount(): Promise<number> {
     await this.store.ensureTableInDatabase(1536);
     const result = await this.store.pool.query<{ count: number }>(
@@ -155,6 +204,12 @@ export class ChatBot {
     return result.rows[0]?.count ?? 0;
   }
 
+  /**
+   * Deletes every chunk from the vector table, leaving the table itself in
+   * place. Useful for re-ingesting a knowledge base from scratch.
+   *
+   * @returns The number of rows deleted.
+   */
   async clearTable(): Promise<number> {
     await this.store.ensureTableInDatabase(1536);
     const result = await this.store.pool.query<{ count: number }>(
@@ -168,6 +223,13 @@ export class ChatBot {
     return result.rows[0]?.count ?? 0;
   }
 
+  /**
+   * Renders retrieved documents into the numbered, source-labelled block that
+   * gets injected into the prompt as grounding context.
+   *
+   * @param documents The retrieved chunks (may be empty/undefined).
+   * @returns A formatted context string, or a "no documents" placeholder.
+   */
   private formatDocsForRetrieve(documents?: Document[]): string {
     if (!documents || documents?.length === 0) return "No relevant documents found";
 
@@ -179,6 +241,16 @@ export class ChatBot {
       .join("\n\n --- \n\n");
   }
 
+  /**
+   * Builds the retriever used by {@link ask}. In basic mode this is a plain
+   * similarity retriever (top 4). In advanced mode it wraps that in a
+   * multi-query strategy: the LLM rewrites the question into several search
+   * queries, each is retrieved in parallel, and the results are flattened and
+   * deduped — improving recall for questions phrased differently to the source.
+   *
+   * @returns Either the base retriever or an object exposing the same
+   *   `invoke(question)` contract.
+   */
   private buildRetriever() {
     const baseRetriever = this.store.asRetriever({ searchType: "similarity", k: 4 });
     if (!this.advancedRetriever) return baseRetriever;
@@ -205,6 +277,7 @@ Rules:
       invoke: async (question: string): Promise<Document[]> => {
         const result = await queryGenerator.invoke({ question });
         const queries = [question, ...result.queries];
+        console.debug(`Multi query result: ${queries}`);
         const nestedDocs = await Promise.all(queries.map((query) => baseRetriever.invoke(query)));
         const docs = nestedDocs.flat();
         return this.dedupeDocuments(docs);
@@ -212,6 +285,12 @@ Rules:
     };
   }
 
+  /**
+   * Gets the message history for a session, lazily creating an empty one on
+   * first use so callers always receive a valid store.
+   *
+   * @param sessionId The conversation to look up.
+   */
   private getSessionHistory(sessionId: string): InMemoryChatMessageHistory {
     let messageHistory = this.sessionStore.get(sessionId);
     if (!messageHistory) {
@@ -222,6 +301,13 @@ Rules:
     return messageHistory;
   }
 
+  /**
+   * Removes duplicate chunks that the multi-query fan-out returns more than
+   * once, keyed on source + id + a content prefix. Keeps first occurrence.
+   *
+   * @param docs Possibly-overlapping documents from several queries.
+   * @returns The documents with duplicates removed.
+   */
   private dedupeDocuments(docs: Document[]): Document[] {
     const seen = new Set<string>();
     const unique: Document[] = [];
